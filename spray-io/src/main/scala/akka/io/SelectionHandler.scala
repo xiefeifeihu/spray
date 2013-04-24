@@ -128,7 +128,8 @@ private[io] class SelectionHandler(manager: ActorRef, settings: SelectionHandler
 
   def execute(task: Task): Unit = {
     selectorManagementDispatcher.execute(task)
-    selector.wakeup()
+    if (potentiallyInBlockingSelect)
+      selector.wakeup()
   }
 
   def updateKeyMap(child: ActorRef, key: SelectionKey): Unit =
@@ -170,9 +171,16 @@ private[io] class SelectionHandler(manager: ActorRef, settings: SelectionHandler
       }
     }
 
+  @volatile var potentiallyInBlockingSelect: Boolean = false
   val select = new Task {
     def tryRun() {
-      if (selector.select() > 0) {
+      potentiallyInBlockingSelect = true
+      val selected =
+        if (selectorManagementDispatcher.inhabitants > 1) selector.selectNow()
+        else selector.select()
+      potentiallyInBlockingSelect = false
+
+      if (selected > 0) {
         val keys = selector.selectedKeys
         val iterator = keys.iterator()
         while (iterator.hasNext) {
