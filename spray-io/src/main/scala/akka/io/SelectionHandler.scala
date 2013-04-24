@@ -23,10 +23,6 @@ abstract class SelectionHandlerSettings(config: Config) {
     case "unlimited" ⇒ -1
     case _           ⇒ getInt("max-channels")
   }
-  val SelectTimeout = getString("select-timeout") match {
-    case "infinite" ⇒ Duration.Inf
-    case x          ⇒ Duration(x)
-  }
   val SelectorAssociationRetries = getInt("selector-association-retries")
 
   val SelectorDispatcher = getString("selector-dispatcher")
@@ -34,7 +30,6 @@ abstract class SelectionHandlerSettings(config: Config) {
   val TraceLogging = getBoolean("trace-logging")
 
   require(MaxChannels == -1 || MaxChannels > 0, "max-channels must be > 0 or 'unlimited'")
-  require(SelectTimeout >= Duration.Zero, "select-timeout must not be negative")
   require(SelectorAssociationRetries >= 0, "selector-association-retries must be >= 0")
 
   def MaxChannelsPerSelector: Int
@@ -176,14 +171,8 @@ private[io] class SelectionHandler(manager: ActorRef, settings: SelectionHandler
     }
 
   val select = new Task {
-    val doSelect: () ⇒ Int =
-      SelectTimeout match {
-        case Duration.Zero ⇒ () ⇒ selector.selectNow()
-        case Duration.Inf  ⇒ () ⇒ selector.select()
-        case x             ⇒ val millis = x.toMillis; () ⇒ selector.select(millis)
-      }
     def tryRun() {
-      if (doSelect() > 0) {
+      if (selector.select() > 0) {
         val keys = selector.selectedKeys
         val iterator = keys.iterator()
         while (iterator.hasNext) {
