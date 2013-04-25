@@ -21,7 +21,7 @@ import scala.collection.immutable
 private[io] class TcpOutgoingConnection(_tcp: TcpExt,
                                         commander: ActorRef,
                                         connect: Connect)
-    extends TcpConnection(TcpOutgoingConnection.newSocketChannel(), _tcp) {
+    extends TcpConnection(TcpOutgoingConnection.newSocketChannel(), _tcp, SelectionKey.OP_CONNECT) {
 
   import connect._
 
@@ -29,7 +29,7 @@ private[io] class TcpOutgoingConnection(_tcp: TcpExt,
 
   localAddress.foreach(channel.socket.bind)
   options.foreach(_.beforeConnect(channel.socket))
-  selector ! RegisterChannel(channel, SelectionKey.OP_CONNECT)
+  selector ! registration
 
   def receive: Receive = {
     case ChannelRegistered ⇒

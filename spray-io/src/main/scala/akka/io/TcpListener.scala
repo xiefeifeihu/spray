@@ -22,7 +22,6 @@ private[io] object TcpListener {
   }
 
   case class FailedRegisterIncoming(channel: SocketChannel)
-
 }
 
 /**
@@ -51,7 +50,9 @@ private[io] class TcpListener(val selectorRouter: ActorRef,
     }
     serverSocketChannel
   }
-  context.parent ! RegisterChannel(channel, SelectionKey.OP_ACCEPT)
+  val registration = new ConnectionRegistration(channel, self, SelectionKey.OP_ACCEPT)
+  context.parent ! registration
+
   log.debug("Successfully bound to {}", endpoint)
 
   def receive: Receive = {
@@ -92,7 +93,7 @@ private[io] class TcpListener(val selectorRouter: ActorRef,
       socketChannel.configureBlocking(false)
       selectorRouter ! WorkerForCommand(RegisterIncoming(socketChannel), self, Props(new TcpIncomingConnection(socketChannel, tcp, handler, options)))
       acceptAllPending(limit - 1)
-    } else context.parent ! AcceptInterest
+    } else registration.enableInterest(SelectionKey.OP_ACCEPT)
   }
 
   override def postStop() {

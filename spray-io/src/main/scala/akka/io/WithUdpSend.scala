@@ -6,7 +6,7 @@ package akka.io
 import akka.actor.{ ActorRef, ActorLogging, Actor }
 import akka.io.Udp.{ CommandFailed, Send }
 import akka.io.SelectionHandler._
-import java.nio.channels.DatagramChannel
+import java.nio.channels.{ SelectionKey, DatagramChannel }
 
 /**
  * INTERNAL API
@@ -21,8 +21,8 @@ private[io] trait WithUdpSend {
   var retriedSend = false
   def hasWritePending = pendingSend ne null
 
-  def selector: ActorRef
   def channel: DatagramChannel
+  def registration: ConnectionRegistration
   def udp: UdpExt
   val settings = udp.settings
 
@@ -65,7 +65,7 @@ private[io] trait WithUdpSend {
           pendingSend = null
           pendingCommander = null
         } else {
-          selector ! WriteInterest
+          registration.enableInterest(SelectionKey.OP_WRITE)
           retriedSend = true
         }
       } else {

@@ -43,7 +43,8 @@ private[io] class UdpListener(val udp: UdpExt,
     }
     datagramChannel
   }
-  context.parent ! RegisterChannel(channel, OP_READ)
+  val registration = new ConnectionRegistration(channel, self, OP_READ)
+  context.parent ! registration
   log.debug("Successfully bound to [{}]", endpoint)
 
   def receive: Receive = {
@@ -53,8 +54,8 @@ private[io] class UdpListener(val udp: UdpExt,
   }
 
   def readHandlers: Receive = {
-    case StopReading     ⇒ selector ! DisableReadInterest
-    case ResumeReading   ⇒ selector ! ReadInterest
+    case StopReading     ⇒ registration.disableInterest(OP_READ)
+    case ResumeReading   ⇒ registration.enableInterest(OP_READ)
     case ChannelReadable ⇒ doReceive(handler)
 
     case Unbind ⇒
@@ -83,7 +84,7 @@ private[io] class UdpListener(val udp: UdpExt,
     val buffer = bufferPool.acquire()
     try innerReceive(BatchReceiveLimit, buffer) finally {
       bufferPool.release(buffer)
-      selector ! ReadInterest
+      registration.enableInterest(OP_READ)
     }
   }
 

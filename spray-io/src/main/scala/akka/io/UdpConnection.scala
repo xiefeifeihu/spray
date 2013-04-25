@@ -47,7 +47,8 @@ private[io] class UdpConnection(val udpConn: UdpConnectedExt,
     }
     datagramChannel
   }
-  selector ! RegisterChannel(channel, OP_READ)
+  val registration = new ConnectionRegistration(channel, self, OP_READ)
+  selector ! registration
   log.debug("Successfully connected to [{}]", remoteAddress)
 
   def receive = {
@@ -57,8 +58,8 @@ private[io] class UdpConnection(val udpConn: UdpConnectedExt,
   }
 
   def connected: Receive = {
-    case StopReading     ⇒ selector ! DisableReadInterest
-    case ResumeReading   ⇒ selector ! ReadInterest
+    case StopReading     ⇒ registration.disableInterest(OP_READ)
+    case ResumeReading   ⇒ registration.enableInterest(OP_READ)
     case ChannelReadable ⇒ doRead(handler)
 
     case Close ⇒
@@ -78,7 +79,7 @@ private[io] class UdpConnection(val udpConn: UdpConnectedExt,
 
     case send: Send ⇒
       pendingSend = (send, sender)
-      selector ! WriteInterest
+      registration.enableInterest(OP_WRITE)
 
     case ChannelWritable ⇒ doWrite()
   }
@@ -96,7 +97,7 @@ private[io] class UdpConnection(val udpConn: UdpConnectedExt,
     }
     val buffer = bufferPool.acquire()
     try innerRead(BatchReceiveLimit, buffer) finally {
-      selector ! ReadInterest
+      registration.enableInterest(OP_READ)
       bufferPool.release(buffer)
     }
   }

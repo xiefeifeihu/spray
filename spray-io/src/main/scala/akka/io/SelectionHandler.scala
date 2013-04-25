@@ -5,16 +5,16 @@
 package akka.io
 
 import java.lang.Runnable
-import java.nio.channels.spi.SelectorProvider
-import java.nio.channels.{ SelectableChannel, SelectionKey, CancelledKeyException, ClosedSelectorException }
+import java.nio.channels.spi.{ AbstractSelector, SelectorProvider }
+import java.nio.channels._
 import java.nio.channels.SelectionKey._
-import scala.util.control.NonFatal
-import scala.collection.immutable
-import scala.concurrent.duration._
-import akka.actor._
+import java.util.concurrent.atomic.AtomicBoolean
 import com.typesafe.config.Config
-import akka.actor.Terminated
+import scala.annotation.tailrec
+import scala.util.control.NonFatal
+import scala.concurrent.duration.Duration
 import akka.io.IO.HasFailureMessage
+import akka.actor._
 
 abstract class SelectionHandlerSettings(config: Config) {
   import config._
@@ -45,7 +45,6 @@ private[io] object SelectionHandler {
 
   case class WorkerForCommand(apiCommand: HasFailureMessage, commander: ActorRef, childProps: Props)
 
-  case class RegisterChannel(channel: SelectableChannel, initialOps: Int)
   case object ChannelRegistered
   case class Retry(command: WorkerForCommand, retriesLeft: Int) { require(retriesLeft >= 0) }
 
@@ -53,34 +52,58 @@ private[io] object SelectionHandler {
   case object ChannelAcceptable
   case object ChannelReadable
   case object ChannelWritable
-  case object AcceptInterest
-  case object ReadInterest
-  case object DisableReadInterest
-  case object WriteInterest
+
+  final class ConnectionRegistration(val channel: SelectableChannel, val channelActor: ActorRef, initialOps: Int) {
+    @volatile private[this] var _key: SelectionKey = _
+    private[this] var _ops: Int = initialOps
+    private[this] val currentlySettingInterest = new AtomicBoolean // TODO: remove (use AtomicFieldUpdater instead)
+
+    private[SelectionHandler] def registerWith(selector: AbstractSelector): Unit =
+      _key = channel.register(selector, initialOps, this)
+
+    @tailrec private[SelectionHandler] def enableInterestWithoutWakeup(ops: Int): SelectionKey =
+      if (currentlySettingInterest.getAndSet(true))
+        enableInterestWithoutWakeup(ops)
+      else
+        try setInterest(_ops | ops)
+        finally currentlySettingInterest.set(false)
+
+    @tailrec private[SelectionHandler] def disableInterestWithoutWakeup(ops: Int): SelectionKey =
+      if (currentlySettingInterest.getAndSet(true))
+        disableInterestWithoutWakeup(ops)
+      else
+        try setInterest(_ops & ~ops)
+        finally currentlySettingInterest.set(false)
+
+    private def setInterest(ops: Int): SelectionKey = {
+      _ops = ops
+      val key = _key // only read the volatile field once
+      key.interestOps(ops)
+      key
+    }
+
+    def enableInterest(ops: Int): Unit = enableInterestWithoutWakeup(ops).selector.wakeup()
+    def disableInterest(ops: Int): Unit = disableInterestWithoutWakeup(ops).selector.wakeup()
+  }
 }
 
 private[io] class SelectionHandler(manager: ActorRef, settings: SelectionHandlerSettings) extends Actor with ActorLogging {
   import SelectionHandler._
   import settings._
 
-  @volatile var childrenKeys = immutable.HashMap.empty[String, SelectionKey]
+  var connectionCount = 0
   val sequenceNumber = Iterator.from(0)
   val selectorManagementDispatcher = context.system.dispatchers.lookup(SelectorDispatcher)
   val selector = SelectorProvider.provider.openSelector
   final val OP_READ_AND_WRITE = OP_READ | OP_WRITE // compile-time constant
 
   def receive: Receive = {
-    case WriteInterest       ⇒ execute(enableInterest(OP_WRITE, sender))
-    case ReadInterest        ⇒ execute(enableInterest(OP_READ, sender))
-    case AcceptInterest      ⇒ execute(enableInterest(OP_ACCEPT, sender))
-
-    case DisableReadInterest ⇒ execute(disableInterest(OP_READ, sender))
-
     case cmd: WorkerForCommand ⇒
       withCapacityProtection(cmd, SelectorAssociationRetries) { spawnChild(cmd.childProps) }
 
-    case RegisterChannel(channel, initialOps) ⇒
-      execute(registerChannel(channel, sender, initialOps))
+    case reg: ConnectionRegistration ⇒
+      selectorManagementDispatcher.execute(register(reg))
+      selector.wakeup()
 
     case Retry(WorkerForCommand(cmd, commander, _), 0) ⇒
       commander ! cmd.failureMessage
@@ -88,8 +111,7 @@ private[io] class SelectionHandler(manager: ActorRef, settings: SelectionHandler
     case Retry(cmd, retriesLeft) ⇒
       withCapacityProtection(cmd, retriesLeft) { spawnChild(cmd.childProps) }
 
-    case Terminated(child) ⇒
-      execute(unregister(child))
+    case Terminated(child) ⇒ connectionCount -= 1
   }
 
   override def postStop() {
@@ -114,7 +136,7 @@ private[io] class SelectionHandler(manager: ActorRef, settings: SelectionHandler
 
   def withCapacityProtection(cmd: WorkerForCommand, retriesLeft: Int)(body: ⇒ Unit): Unit = {
     if (TraceLogging) log.debug("Executing [{}]", cmd)
-    if (MaxChannelsPerSelector == -1 || childrenKeys.size < MaxChannelsPerSelector) {
+    if (MaxChannelsPerSelector == -1 || context.children.size < MaxChannelsPerSelector) {
       body
     } else {
       log.warning("Rejecting [{}] with [{}] retries left, retrying...", cmd, retriesLeft)
@@ -122,56 +144,22 @@ private[io] class SelectionHandler(manager: ActorRef, settings: SelectionHandler
     }
   }
 
-  def spawnChild(props: Props): ActorRef =
-    context.watch {
-      context.actorOf(
-        props = props.withDispatcher(WorkerDispatcher),
-        name = sequenceNumber.next().toString)
+  def spawnChild(props: Props): ActorRef = {
+    val child = context.actorOf(props.withDispatcher(WorkerDispatcher), sequenceNumber.next().toString)
+    if (MaxChannelsPerSelector > 0) {
+      context.watch(child) // we don't need to watch the child if we don't have to "uncount" connections
+      connectionCount += 1
     }
+    child
+  }
 
   //////////////// Management Tasks scheduled via the selectorManagementDispatcher /////////////
 
-  def execute(task: Task): Unit = {
-    selectorManagementDispatcher.execute(task)
-    selector.wakeup()
-  }
-
-  def updateKeyMap(child: ActorRef, key: SelectionKey): Unit =
-    childrenKeys = childrenKeys.updated(child.path.name, key)
-
-  def registerChannel(channel: SelectableChannel, channelActor: ActorRef, initialOps: Int): Task =
+  def register(reg: ConnectionRegistration): Task =
     new Task {
       def tryRun() {
-        updateKeyMap(channelActor, channel.register(selector, initialOps, channelActor))
-        channelActor ! ChannelRegistered
-      }
-    }
-
-  // TODO: evaluate whether we could run the following two tasks directly on the TcpSelector actor itself rather than
-  // on the selector-management-dispatcher. The trade-off would be using a ConcurrentHashMap
-  // rather than an unsynchronized one, but since switching interest ops is so frequent
-  // the change might be beneficial, provided the underlying implementation really is thread-safe
-  // and behaves consistently on all platforms.
-  def enableInterest(op: Int, connection: ActorRef) =
-    new Task {
-      def tryRun() {
-        val key = childrenKeys(connection.path.name)
-        key.interestOps(key.interestOps | op)
-      }
-    }
-
-  def disableInterest(op: Int, connection: ActorRef) =
-    new Task {
-      def tryRun() {
-        val key = childrenKeys(connection.path.name)
-        key.interestOps(key.interestOps & ~op)
-      }
-    }
-
-  def unregister(child: ActorRef) =
-    new Task {
-      def tryRun() {
-        childrenKeys = childrenKeys - child.path.name
+        reg.registerWith(selector)
+        reg.channelActor ! ChannelRegistered
       }
     }
 
@@ -192,14 +180,14 @@ private[io] class SelectionHandler(manager: ActorRef, settings: SelectionHandler
             try {
               // Cache because the performance implications of calling this on different platforms are not clear
               val readyOps = key.readyOps()
-              key.interestOps(key.interestOps & ~readyOps) // prevent immediate reselection by always clearing
-              val connection = key.attachment.asInstanceOf[ActorRef]
+              val reg = key.attachment.asInstanceOf[ConnectionRegistration]
+              reg.disableInterestWithoutWakeup(readyOps) // prevent immediate reselection by always clearing
               readyOps match {
-                case OP_READ                   ⇒ connection ! ChannelReadable
-                case OP_WRITE                  ⇒ connection ! ChannelWritable
-                case OP_READ_AND_WRITE         ⇒ connection ! ChannelWritable; connection ! ChannelReadable
-                case x if (x & OP_ACCEPT) > 0  ⇒ connection ! ChannelAcceptable
-                case x if (x & OP_CONNECT) > 0 ⇒ connection ! ChannelConnectable
+                case OP_READ                   ⇒ reg.channelActor ! ChannelReadable
+                case OP_WRITE                  ⇒ reg.channelActor ! ChannelWritable
+                case OP_READ_AND_WRITE         ⇒ reg.channelActor ! ChannelWritable; reg.channelActor ! ChannelReadable
+                case x if (x & OP_ACCEPT) > 0  ⇒ reg.channelActor ! ChannelAcceptable
+                case x if (x & OP_CONNECT) > 0 ⇒ reg.channelActor ! ChannelConnectable
                 case x                         ⇒ log.warning("Invalid readyOps: [{}]", x)
               }
             } catch {
@@ -223,7 +211,6 @@ private[io] class SelectionHandler(manager: ActorRef, settings: SelectionHandler
     def run() {
       try tryRun()
       catch {
-        case _: CancelledKeyException   ⇒ // ok, can be triggered in `enableInterest` or `disableInterest`
         case _: ClosedSelectorException ⇒ // ok, expected during shutdown
         case NonFatal(e)                ⇒ log.error(e, "Error during selector management task: [{}]", e)
       }

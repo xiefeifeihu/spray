@@ -6,7 +6,7 @@ package akka.io
 import akka.actor._
 import java.nio.channels.DatagramChannel
 import akka.io.Udp._
-import akka.io.SelectionHandler.{ ChannelRegistered, RegisterChannel }
+import akka.io.SelectionHandler.{ ConnectionRegistration, ChannelRegistered }
 import scala.collection.immutable
 import akka.io.Inet.SocketOption
 import scala.util.control.NonFatal
@@ -28,7 +28,8 @@ private[io] class UdpSender(val udp: UdpExt, options: immutable.Traversable[Sock
 
     datagramChannel
   }
-  selector ! RegisterChannel(channel, 0)
+  val registration = new ConnectionRegistration(channel, self, initialOps = 0)
+  selector ! registration
 
   def receive: Receive = {
     case ChannelRegistered ⇒

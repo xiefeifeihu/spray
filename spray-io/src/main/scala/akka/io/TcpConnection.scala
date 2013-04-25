@@ -7,6 +7,7 @@ package akka.io
 import java.net.InetSocketAddress
 import java.io.IOException
 import java.nio.channels.SocketChannel
+import java.nio.channels.SelectionKey._
 import java.nio.ByteBuffer
 import scala.annotation.tailrec
 import scala.collection.immutable
@@ -24,14 +25,15 @@ import akka.io.SelectionHandler._
  * INTERNAL API
  */
 private[io] abstract class TcpConnection(val channel: SocketChannel,
-                                         val tcp: TcpExt) extends Actor with ActorLogging {
+                                         val tcp: TcpExt,
+                                         initialOps: Int) extends Actor with ActorLogging {
   import tcp.Settings._
   import tcp.bufferPool
   import TcpConnection._
-  var pendingWrite: PendingWrite = null
 
-  // Needed to send the ConnectionClosed message in the postStop handler.
-  var closedMessage: CloseInformation = null
+  val registration = new ConnectionRegistration(channel, self, initialOps)
+  var pendingWrite: PendingWrite = null
+  var closedMessage: CloseInformation = null // needed to send the ConnectionClosed message in the postStop handler
 
   private[this] var peerClosed = false
   private[this] var keepOpenOnPeerClosed = false
@@ -70,8 +72,8 @@ private[io] abstract class TcpConnection(val channel: SocketChannel,
 
   /** normal connected state */
   def connected(handler: ActorRef): Receive = handleWriteMessages(handler) orElse {
-    case StopReading           ⇒ selector ! DisableReadInterest
-    case ResumeReading         ⇒ selector ! ReadInterest
+    case StopReading           ⇒ registration.disableInterest(OP_READ)
+    case ResumeReading         ⇒ registration.enableInterest(OP_READ)
     case ChannelReadable       ⇒ doRead(handler, None)
 
     case cmd: CloseCommand     ⇒ handleClose(handler, Some(sender), cmd.event)
@@ -88,8 +90,8 @@ private[io] abstract class TcpConnection(val channel: SocketChannel,
 
   /** connection is closing but a write has to be finished first */
   def closingWithPendingWrite(handler: ActorRef, closeCommander: Option[ActorRef], closedEvent: ConnectionClosed): Receive = {
-    case StopReading     ⇒ selector ! DisableReadInterest
-    case ResumeReading   ⇒ selector ! ReadInterest
+    case StopReading     ⇒ registration.disableInterest(OP_READ)
+    case ResumeReading   ⇒ registration.enableInterest(OP_READ)
     case ChannelReadable ⇒ doRead(handler, closeCommander)
 
     case ChannelWritable ⇒
@@ -104,8 +106,8 @@ private[io] abstract class TcpConnection(val channel: SocketChannel,
 
   /** connection is closed on our side and we're waiting from confirmation from the other side */
   def closing(handler: ActorRef, closeCommander: Option[ActorRef]): Receive = {
-    case StopReading           ⇒ selector ! DisableReadInterest
-    case ResumeReading         ⇒ selector ! ReadInterest
+    case StopReading           ⇒ registration.disableInterest(OP_READ)
+    case ResumeReading         ⇒ registration.enableInterest(OP_READ)
     case ChannelReadable       ⇒ doRead(handler, closeCommander)
     case Abort                 ⇒ handleClose(handler, Some(sender), Aborted)
     case Terminated(`handler`) ⇒ handlerTerminated()
@@ -173,7 +175,7 @@ private[io] abstract class TcpConnection(val channel: SocketChannel,
 
     val buffer = bufferPool.acquire()
     try innerRead(buffer, ReceivedMessageSizeLimit) match {
-      case AllRead         ⇒ selector ! ReadInterest
+      case AllRead         ⇒ registration.enableInterest(OP_READ)
       case MoreDataWaiting ⇒ self ! ChannelReadable
       case EndOfStream if channel.socket.isOutputShutdown ⇒
         if (TraceLogging) log.debug("Read returned end-of-stream, our side already closed")
@@ -197,7 +199,7 @@ private[io] abstract class TcpConnection(val channel: SocketChannel,
 
       if (pendingWrite.hasData)
         if (writtenBytes == toWrite) innerWrite() // wrote complete buffer, try again now
-        else selector ! WriteInterest // try again later
+        else registration.enableInterest(OP_WRITE) // try again later
       else { // everything written
         if (pendingWrite.wantsAck)
           pendingWrite.commander ! pendingWrite.ack
